@@ -10,6 +10,12 @@ dependencies:
   flutter:
     sdk: flutter
 
+  # Dart FFI: loads cef_bridge.dll and drives the embedded browser.
+  ffi: ^2.1.0
+
+  # Resolves the cef_bridge.dll that sits next to the executable.
+  path: ^1.9.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

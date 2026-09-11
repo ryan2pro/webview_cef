@@ -2,12 +2,17 @@
 
 #include <optional>
 
+#include "cef_bridge.h"
 #include "flutter/generated_plugin_registrant.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
 FlutterWindow::~FlutterWindow() {}
+
+void FlutterWindow::SetCefEnabled(bool enabled) {
+  cef_enabled_ = enabled;
+}
 
 bool FlutterWindow::OnCreate() {
   if (!Win32Window::OnCreate()) {
@@ -25,7 +30,17 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
-  SetChildContent(flutter_controller_->view()->GetNativeWindow());
+
+  const HWND flutter_view = flutter_controller_->view()->GetNativeWindow();
+  SetChildContent(flutter_view);
+
+  if (cef_enabled_) {
+    // Embedded browsers are parented to the Flutter view window rather than to
+    // the top level window. That makes browser coordinates share the Flutter
+    // coordinate origin, so no non-client-area offset has to be compensated for
+    // when Dart pushes geometry.
+    cef_bridge_set_host_window(flutter_view);
+  }
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -40,6 +55,12 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  if (cef_enabled_) {
+    // The view window is going away, so the bridge must not hand it out as a
+    // parent for any browser created during teardown.
+    cef_bridge_set_host_window(nullptr);
+  }
+
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }

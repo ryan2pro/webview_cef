@@ -49,6 +49,50 @@ endfunction()
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
 
+# === CEF (Chromium Embedded Framework) ======================================
+# Windowed rendering integration: CEF runs inside this process (the runner exe)
+# and creates a real child HWND that is overlaid on top of the Flutter view.
+# Geometry is driven from Dart through FFI; see runner/cef_bridge.*.
+#
+# The CEF native bridge is built as a separate shared library (cef_bridge.dll)
+# so that the runner exe (CEF process bootstrap, on the process main thread) and
+# Dart FFI (runtime browser control) can drive the same CEF instance.
+set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cef")
+if(NOT IS_DIRECTORY "${CEF_ROOT}/cmake")
+  message(FATAL_ERROR
+    "CEF binary distribution not found at '${CEF_ROOT}'.\n"
+    "Fetch it first by running:\n"
+    "  powershell -ExecutionPolicy Bypass -File windows/scripts/fetch_cef.ps1")
+endif()
+
+# This CEF distribution ships x64 binaries only.
+set(PROJECT_ARCH "x86_64" CACHE STRING "CEF target architecture" FORCE)
+
+# The sandbox build turns the host into a DLL launched by bootstrap.exe, which
+# is incompatible with the Flutter runner layout. Browsers are therefore created
+# unsandboxed (CefSettings::no_sandbox); revisit this for a hardened build.
+set(USE_SANDBOX OFF CACHE BOOL "Enable or disable use of the CEF sandbox." FORCE)
+
+# CEF defaults to the static CRT (/MT) whereas the Flutter runner uses the
+# dynamic CRT (/MD, /MDd). libcef_dll_wrapper is a static library that gets
+# linked into cef_bridge.dll, so the runtime library must match the runner.
+set(CEF_RUNTIME_LIBRARY_FLAG "/MD" CACHE STRING "CEF runtime library flag" FORCE)
+
+list(APPEND CMAKE_MODULE_PATH "${CEF_ROOT}/cmake")
+find_package(CEF REQUIRED)
+
+# Defines the `libcef_dll_wrapper` static library target.
+add_subdirectory(${CEF_LIBCEF_DLL_WRAPPER_PATH} libcef_dll_wrapper)
+
+# Logical imported target used to link the prebuilt libcef import library.
+ADD_LOGICAL_TARGET("libcef_lib" "${CEF_LIB_DEBUG}" "${CEF_LIB_RELEASE}")
+
+# CEF only ships Debug and Release binaries, while Flutter also builds a Profile
+# configuration. Map anything that is not Debug onto the Release binaries, since
+# CEF_BINARY_DIR itself expands to a nonexistent "Profile" directory otherwise.
+set(CEF_DIST_BINARY_DIR
+    "$<IF:$<CONFIG:Debug>,${CEF_BINARY_DIR_DEBUG},${CEF_BINARY_DIR_RELEASE}>")
+
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 
