@@ -2,12 +2,14 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "include/base/cef_bind.h"
@@ -56,6 +58,18 @@ struct BrowserSlot {
   bool has_bounds = false;
 
   bool visible = true;
+
+  /// Visible rectangles requested from Dart, in physical pixels relative to the
+  /// host window client area, or empty for "the browser is fully covered".
+  /// Only meaningful while [has_clip] is set: before Dart ever reports an
+  /// occlusion the browser carries no window region at all.
+  std::vector<CefRect> clip_rects;
+  bool has_clip = false;
+
+  /// Whether the browser window currently carries a window region. Written on
+  /// the CEF UI thread, read there too, so that the common "nothing is clipped"
+  /// geometry update does not cost an extra SetWindowRgn.
+  bool region_applied = false;
 
   /// Initial URL, consumed when the browser is created.
   std::string url;
@@ -194,7 +208,112 @@ CefRefPtr<CefBrowser> BrowserForSlot(int64_t slot) {
   return state == nullptr ? CefRefPtr<CefBrowser>() : state->browser;
 }
 
-/// Moves/resizes and shows/hides the browser window.
+/// Translates a rectangle from host client space into the browser window's own
+/// coordinate system, which is what SetWindowRgn expects.
+RECT ToWindowRect(const CefRect& rect, const CefRect& slot, int dx, int dy) {
+  RECT result = {};
+  result.left = rect.x - slot.x + dx;
+  result.top = rect.y - slot.y + dy;
+  result.right = result.left + rect.width;
+  result.bottom = result.top + rect.height;
+  return result;
+}
+
+/// Offset between the browser window's client origin and its window origin.
+///
+/// CEF's windowed child is borderless, so this is normally (0, 0), which makes
+/// window and client coordinates interchangeable. Measuring it anyway keeps the
+/// region correct should that ever stop being true.
+void GetClientOriginOffset(HWND hwnd, int* dx, int* dy) {
+  *dx = 0;
+  *dy = 0;
+
+  RECT window_rect = {};
+  POINT client_origin = {0, 0};
+  if (::GetWindowRect(hwnd, &window_rect) == FALSE ||
+      ::ClientToScreen(hwnd, &client_origin) == FALSE) {
+    return;
+  }
+  *dx = client_origin.x - window_rect.left;
+  *dy = client_origin.y - window_rect.top;
+}
+
+/// Applies \p rects as the window region of \p hwnd.
+///
+/// A region that covers the whole client area, or no region at all, is
+/// expressed by clearing the region: while nothing is clipped the window stays
+/// free of region bookkeeping, so the common case costs nothing.
+///
+/// \return True when the window now carries a region.
+bool ApplyWindowRegion(HWND hwnd,
+                       const CefRect& slot,
+                       const std::vector<CefRect>& rects) {
+  if (rects.empty()) {
+    ::SetWindowRgn(hwnd, nullptr, TRUE);
+    return false;
+  }
+
+  RECT client = {};
+  ::GetClientRect(hwnd, &client);
+
+  int dx = 0;
+  int dy = 0;
+  GetClientOriginOffset(hwnd, &dx, &dy);
+
+  std::vector<RECT> window_rects;
+  window_rects.reserve(rects.size());
+  for (const CefRect& rect : rects) {
+    window_rects.push_back(ToWindowRect(rect, slot, dx, dy));
+  }
+
+  if (window_rects.size() == 1 && window_rects[0].left <= client.left &&
+      window_rects[0].top <= client.top &&
+      window_rects[0].right >= client.right &&
+      window_rects[0].bottom >= client.bottom) {
+    // The whole window is visible, so a region would be pure overhead.
+    ::SetWindowRgn(hwnd, nullptr, TRUE);
+    return false;
+  }
+
+  // One ExtCreateRegion call instead of a CombineRgn chain: the region is built
+  // off-screen and only handed to the window once it is complete, so the window
+  // never presents an intermediate shape.
+  const size_t bytes =
+      sizeof(RGNDATAHEADER) + window_rects.size() * sizeof(RECT);
+  std::vector<unsigned char> buffer(bytes);
+  RGNDATA* data = reinterpret_cast<RGNDATA*>(buffer.data());
+  data->rdh.dwSize = sizeof(RGNDATAHEADER);
+  data->rdh.iType = RDH_RECTANGLES;
+  data->rdh.nCount = static_cast<DWORD>(window_rects.size());
+  data->rdh.nRgnSize = static_cast<DWORD>(window_rects.size() * sizeof(RECT));
+
+  RECT* output = reinterpret_cast<RECT*>(data->Buffer);
+  RECT bound = window_rects[0];
+  for (size_t i = 0; i < window_rects.size(); ++i) {
+    output[i] = window_rects[i];
+    bound.left = std::min(bound.left, output[i].left);
+    bound.top = std::min(bound.top, output[i].top);
+    bound.right = std::max(bound.right, output[i].right);
+    bound.bottom = std::max(bound.bottom, output[i].bottom);
+  }
+  data->rdh.rcBound = bound;
+
+  HRGN region = ::ExtCreateRegion(nullptr, static_cast<DWORD>(bytes), data);
+  if (region == nullptr) {
+    OutputDebugStringW(L"cef_bridge: could not build a window region\n");
+    return false;
+  }
+
+  // On success the system owns the region; deleting it would be a bug.
+  if (::SetWindowRgn(hwnd, region, TRUE) == 0) {
+    ::DeleteObject(region);
+    OutputDebugStringW(L"cef_bridge: SetWindowRgn failed\n");
+    return false;
+  }
+  return true;
+}
+
+/// Moves/resizes, shows/hides and clips the browser window.
 /// Runs on the CEF UI thread.
 void ApplyStateOnUiThread(int64_t slot) {
   CEF_REQUIRE_UI_THREAD();
@@ -203,6 +322,9 @@ void ApplyStateOnUiThread(int64_t slot) {
   CefRect bounds(0, 0, 0, 0);
   bool has_bounds = false;
   bool visible = true;
+  bool has_clip = false;
+  bool region_applied = false;
+  std::vector<CefRect> clip_rects;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     const BrowserSlot* state = FindSlotLocked(slot);
@@ -213,11 +335,20 @@ void ApplyStateOnUiThread(int64_t slot) {
     bounds = state->bounds;
     has_bounds = state->has_bounds;
     visible = state->visible;
+    has_clip = state->has_clip;
+    region_applied = state->region_applied;
+    clip_rects = state->clip_rects;
   }
 
   if (!browser.get() || !has_bounds) {
     return;
   }
+
+  // An empty region is an empty visible area, so it hides the window on its own
+  // and no ordering rule between cef_bridge_set_clip and cef_bridge_set_visible
+  // is required of the caller.
+  const bool region_empty = has_clip && clip_rects.empty();
+  const bool show = visible && !region_empty;
 
   CefRefPtr<CefBrowserHost> host = browser->GetHost();
   if (!host.get()) {
@@ -235,9 +366,27 @@ void ApplyStateOnUiThread(int64_t slot) {
   host->NotifyMoveOrResizeStarted();
 
   UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
-  flags |= visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW;
+  flags |= show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW;
   ::SetWindowPos(hwnd, nullptr, bounds.x, bounds.y, bounds.width, bounds.height,
                  flags);
+
+  // Only touch the window region when the state actually changes: scrolling and
+  // resizing post this function on every frame, and re-clearing an absent region
+  // would repaint the window for nothing.
+  if (has_clip && !region_empty) {
+    region_applied = ApplyWindowRegion(hwnd, bounds, clip_rects);
+  } else if (region_applied) {
+    ::SetWindowRgn(hwnd, nullptr, TRUE);
+    region_applied = false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    BrowserSlot* state = FindSlotLocked(slot);
+    if (state != nullptr) {
+      state->region_applied = region_applied;
+    }
+  }
 }
 
 /// Creates the browser window for \p slot as a child of the host window.
@@ -527,6 +676,44 @@ void cef_bridge_set_visible(int64_t slot, int32_t visible) {
   }
 
   if (!has_browser) {
+    return;
+  }
+  CefPostTask(TID_UI, base::BindOnce(&ApplyStateOnUiThread, slot));
+}
+
+void cef_bridge_set_clip(int64_t slot,
+                         const CefBridgeRect* rects,
+                         int32_t count) {
+  if (count < 0 || (count > 0 && rects == nullptr)) {
+    return;
+  }
+
+  std::vector<CefRect> clip_rects;
+  clip_rects.reserve(static_cast<size_t>(count));
+  for (int32_t i = 0; i < count; ++i) {
+    const CefBridgeRect& rect = rects[i];
+    if (rect.width <= 0 || rect.height <= 0) {
+      // Degenerate rectangles would make an empty region out of a partial clip.
+      continue;
+    }
+    clip_rects.push_back(CefRect(rect.x, rect.y, rect.width, rect.height));
+  }
+
+  bool has_browser = false;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    BrowserSlot* state = FindSlotLocked(slot);
+    if (state == nullptr) {
+      return;
+    }
+    state->clip_rects = std::move(clip_rects);
+    state->has_clip = true;
+    has_browser = state->browser.get() != nullptr;
+  }
+
+  if (!has_browser) {
+    // Creation is still in flight; CefBridgeApplyPendingState() replays this
+    // geometry for the caller.
     return;
   }
   CefPostTask(TID_UI, base::BindOnce(&ApplyStateOnUiThread, slot));

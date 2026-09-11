@@ -16,5 +16,7 @@
 /// ```
 library;
 
-export 'src/native/cef_native_controller.dart' show CefNativeController;
-export 'src/widgets/cef_windowed_view.dart' show CefViewGeometry, CefWindowedView;
+export 'src/native/cef_native_controller.dart'
+    show CefBrowserSurface, CefNativeController;
+export 'src/widgets/cef_windowed_view.dart'
+    show CefClipMode, CefOcclusionState, CefViewGeometry, CefWindowedView;

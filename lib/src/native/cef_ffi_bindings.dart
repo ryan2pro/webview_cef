@@ -1,5 +1,6 @@
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:ui' show Rect;
 
 import 'package:ffi/ffi.dart';
 import 'package:path/path.dart' as p;
@@ -43,6 +44,36 @@ typedef _SetBoundsDart = void Function(
 typedef _SetVisibleNative = Void Function(Int64 slot, Int32 visible);
 typedef _SetVisibleDart = void Function(int slot, int visible);
 
+typedef _SetClipNative = Void Function(
+  Int64 slot,
+  Pointer<CefBridgeRect> rects,
+  Int32 count,
+);
+typedef _SetClipDart = void Function(
+  int slot,
+  Pointer<CefBridgeRect> rects,
+  int count,
+);
+
+/// Plain C rectangle shared with windows/cef/cef_bridge.h.
+///
+/// The native side deliberately takes the plain struct rather than a Dart
+/// object: the array is written into one contiguous allocation and the C entry
+/// point turns it into a window region in a single call.
+final class CefBridgeRect extends Struct {
+  @Int32()
+  external int x;
+
+  @Int32()
+  external int y;
+
+  @Int32()
+  external int width;
+
+  @Int32()
+  external int height;
+}
+
 typedef _LoadUrlNative = Void Function(Int64 slot, Pointer<Utf8> url);
 typedef _LoadUrlDart = void Function(int slot, Pointer<Utf8> url);
 
@@ -64,6 +95,7 @@ class CefNativeBindings {
     this._setVisible,
     this._loadUrl,
     this._destroyBrowser,
+    this._setClip,
   );
 
   /// File name of the native library, always deployed next to the executable.
@@ -75,6 +107,15 @@ class CefNativeBindings {
   final _SetVisibleDart _setVisible;
   final _LoadUrlDart _loadUrl;
   final _DestroyBrowserDart _destroyBrowser;
+
+  /// Region clipping, or null on a bridge that predates it.
+  final _SetClipDart? _setClip;
+
+  /// Whether the loaded bridge can restrict a browser window to a region.
+  ///
+  /// Older builds simply do not export the entry point; the view then falls
+  /// back to hiding the browser instead of clipping it.
+  bool get supportsClipping => _setClip != null;
 
   /// Attempts to bind to the native bridge.
   ///
@@ -107,10 +148,22 @@ class CefNativeBindings {
         library.lookupFunction<_DestroyBrowserNative, _DestroyBrowserDart>(
           'cef_bridge_destroy_browser',
         ),
+        _tryLookupSetClip(library),
       );
     } on ArgumentError {
       // Either the library is not deployed, or it was built from a different
       // bridge revision and no longer exports the expected symbols.
+      return null;
+    }
+  }
+
+  /// Binds clipping, tolerating a bridge that was built before it existed.
+  static _SetClipDart? _tryLookupSetClip(DynamicLibrary library) {
+    try {
+      return library.lookupFunction<_SetClipNative, _SetClipDart>(
+        'cef_bridge_set_clip',
+      );
+    } on ArgumentError {
       return null;
     }
   }
@@ -175,6 +228,41 @@ class CefNativeBindings {
   /// Shows or hides the browser window.
   void setVisible({required int slot, required bool visible}) {
     _setVisible(slot, visible ? 1 : 0);
+  }
+
+  /// Restricts the browser window to [rects], which are physical pixels
+  /// relative to the Flutter view the browser is parented to.
+  ///
+  /// An empty list means the whole browser is covered: the native side clears
+  /// the window region and hides the window.
+  ///
+  /// Returns false when the bridge predates clipping, in which case the caller
+  /// has to fall back to hiding.
+  bool setClip({required int slot, required List<Rect> rects}) {
+    final _SetClipDart? setClip = _setClip;
+    if (setClip == null) {
+      return false;
+    }
+    if (rects.isEmpty) {
+      setClip(slot, nullptr, 0);
+      return true;
+    }
+
+    final Pointer<CefBridgeRect> buffer = calloc<CefBridgeRect>(rects.length);
+    try {
+      for (int i = 0; i < rects.length; i++) {
+        final Rect rect = rects[i];
+        buffer[i]
+          ..x = rect.left.round()
+          ..y = rect.top.round()
+          ..width = rect.width.round()
+          ..height = rect.height.round();
+      }
+      setClip(slot, buffer, rects.length);
+    } finally {
+      calloc.free(buffer);
+    }
+    return true;
   }
 
   /// Navigates to [url].

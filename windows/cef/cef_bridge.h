@@ -32,6 +32,18 @@
 extern "C" {
 #endif
 
+/// A rectangle in physical pixels, relative to the host window's client area.
+///
+/// This is the plain C twin of CefRect, so that the plugin shell never has to
+/// see a CEF header, and both the geometry setters and the clipping entry point
+/// speak the same coordinate space Dart already uses.
+typedef struct CefBridgeRect {
+  int32_t x;
+  int32_t y;
+  int32_t width;
+  int32_t height;
+} CefBridgeRect;
+
 #if defined(CEF_BRIDGE_EXPORTS)
 #define CEF_BRIDGE_API __declspec(dllexport)
 #else
@@ -91,6 +103,26 @@ CEF_BRIDGE_API void cef_bridge_set_bounds(int64_t slot,
 
 /// Shows (non-zero) or hides (zero) the browser window.
 CEF_BRIDGE_API void cef_bridge_set_visible(int64_t slot, int32_t visible);
+
+/// Restricts the browser window of \p slot to the union of \p rects.
+///
+/// Used when Flutter paints over parts of the slot: a native child window
+/// cannot be occluded by its parent's siblings, so the covered area is removed
+/// from the window itself through a window region. The window keeps its size,
+/// position and web content, which is what allows the page to stay alive, stay
+/// scrollable and keep its layout while only the visible part is presented.
+///
+/// Coordinates are physical pixels relative to the host window's client area,
+/// the same space cef_bridge_set_bounds uses. An empty set (\p count == 0)
+/// means the browser is fully covered: the window region is cleared and the
+/// window is hidden. A set that covers the whole client area is treated as "no
+/// clipping" and also clears the region.
+///
+/// Clipping is independent of visibility: whichever of the two ends up
+/// restricting the window more wins, so the calls may be issued in any order.
+CEF_BRIDGE_API void cef_bridge_set_clip(int64_t slot,
+                                        const CefBridgeRect* rects,
+                                        int32_t count);
 
 /// Navigates the browser to \p url (UTF-8).
 CEF_BRIDGE_API void cef_bridge_load_url(int64_t slot, const char* url);

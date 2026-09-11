@@ -43,6 +43,13 @@ class _CefDemoPageState extends State<CefDemoPage> {
   String _loadedUrl = kDefaultUrl;
   bool _browserVisible = true;
   CefViewGeometry? _geometry;
+  CefOcclusionState? _occlusion;
+
+  /// Position of the draggable panel inside the browser area.
+  Offset _panelOffset = const Offset(24, 24);
+
+  /// Draws a semi transparent scrim over the browser.
+  bool _scrimVisible = false;
 
   @override
   void dispose() {
@@ -69,10 +76,12 @@ class _CefDemoPageState extends State<CefDemoPage> {
     CefNativeController.instance()?.loadUrl(slot: slot, url: _loadedUrl);
   }
 
-  /// A Chromium renderer window cannot be occluded by Flutter, so a route that
-  /// covers the region has to ask the browser to hide first.
+  /// Pushes an opaque full screen route over the browser.
+  ///
+  /// Nothing has to be done for the browser to get out of the way: the view
+  /// notices that Flutter covers it entirely and collapses it until the route is
+  /// popped, which is the manual `visible = false` dance this demo used to need.
   Future<void> _openFullScreenOverlay() async {
-    setState(() => _browserVisible = false);
     final NavigatorState navigator = Navigator.of(context);
     await navigator.push<void>(
       MaterialPageRoute<void>(
@@ -84,8 +93,8 @@ class _CefDemoPageState extends State<CefDemoPage> {
             child: Center(
               child: Text(
                 '这一层完全遮住了 CEF 区域。\n\n'
-                '因为原生子窗口永远绘制在 Flutter 内容之上，'
-                '进入本页面前通过 CefWindowedView.visible = false 主动隐藏了浏览器。',
+                '进入本页面前没有调用 visible = false：'
+                '遮挡被自动检测到，网页被整块收起，返回后原样恢复。',
                 textAlign: TextAlign.center,
               ),
             ),
@@ -93,10 +102,53 @@ class _CefDemoPageState extends State<CefDemoPage> {
         ),
       ),
     );
-    if (!mounted) {
-      return;
-    }
-    setState(() => _browserVisible = true);
+  }
+
+  /// An opaque panel the user can drag over the page.
+  ///
+  /// What it covers is clipped away rather than hidden: the page keeps its
+  /// layout, its scroll position and its input, and only the covered part stops
+  /// being presented.
+  Widget _buildDragPanel() {
+    return GestureDetector(
+      onPanUpdate: (DragUpdateDetails details) {
+        setState(() => _panelOffset += details.delta);
+      },
+      child: Container(
+        width: 190,
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+        color: const Color(0xFF1A73E8),
+        child: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Row(
+              children: <Widget>[
+                Icon(Icons.open_with, size: 16, color: Colors.white),
+                SizedBox(width: 6),
+                Text(
+                  '拖到网页上',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: 6),
+            Text(
+              '被这块面板盖住的部分会被真正裁掉，'
+              '而不是让整个网页消失。',
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: 12,
+                height: 1.4,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -105,7 +157,14 @@ class _CefDemoPageState extends State<CefDemoPage> {
       appBar: AppBar(
         title: const Text('CEF 窗口化渲染'),
         actions: <Widget>[
-          Center(child: const Text('显示浏览器')),
+          IconButton(
+            tooltip: _scrimVisible ? '隐藏半透明遮罩' : '显示半透明遮罩',
+            onPressed: () => setState(() => _scrimVisible = !_scrimVisible),
+            icon: Icon(
+              _scrimVisible ? Icons.gradient : Icons.gradient_outlined,
+            ),
+          ),
+          const Center(child: Text('显示浏览器')),
           Switch(
             value: _browserVisible,
             onChanged: (bool value) => setState(() => _browserVisible = value),
@@ -171,12 +230,30 @@ class _CefDemoPageState extends State<CefDemoPage> {
         const SizedBox(height: 16),
         SizedBox(
           height: 420,
-          child: CefWindowedView(
-            url: _loadedUrl,
-            visible: _browserVisible,
-            onGeometryChanged: (CefViewGeometry geometry) {
-              setState(() => _geometry = geometry);
-            },
+          child: Stack(
+            children: <Widget>[
+              Positioned.fill(
+                child: CefWindowedView(
+                  url: _loadedUrl,
+                  visible: _browserVisible,
+                  onGeometryChanged: (CefViewGeometry geometry) {
+                    setState(() => _geometry = geometry);
+                  },
+                  onOcclusionChanged: (CefOcclusionState state) {
+                    setState(() => _occlusion = state);
+                  },
+                ),
+              ),
+              if (_scrimVisible)
+                const Positioned.fill(
+                  child: ColoredBox(color: Color(0x66FF5722)),
+                ),
+              Positioned(
+                left: _panelOffset.dx,
+                top: _panelOffset.dy,
+                child: _buildDragPanel(),
+              ),
+            ],
           ),
         ),
         const SizedBox(height: 16),
@@ -194,6 +271,7 @@ class _CefDemoPageState extends State<CefDemoPage> {
   Widget _buildStatusCard() {
     final CefNativeController? controller = CefNativeController.instance();
     final CefViewGeometry? geometry = _geometry;
+    final CefOcclusionState? occlusion = _occlusion;
 
     return Card(
       margin: EdgeInsets.zero,
@@ -229,10 +307,37 @@ class _CefDemoPageState extends State<CefDemoPage> {
               label: '设备像素比',
               value: MediaQuery.of(context).devicePixelRatio.toStringAsFixed(2),
             ),
+            _StatusRow(
+              label: '区域裁切',
+              value: controller == null
+                  ? '—'
+                  : (controller.supportsClipping ? '可用（SetWindowRgn）' : '不可用'),
+            ),
+            _StatusRow(label: '遮挡状态', value: _describeOcclusion(occlusion)),
+            _StatusRow(
+              label: '可见矩形',
+              value: occlusion == null
+                  ? '—'
+                  : '${occlusion.visibleRects.length} 块 '
+                        '${occlusion.visibleRects.map(_formatRect).join(' | ')}',
+            ),
           ],
         ),
       ),
     );
+  }
+
+  String _describeOcclusion(CefOcclusionState? state) {
+    if (state == null) {
+      return '—';
+    }
+    if (state.fullyOccluded) {
+      return '完全遮挡（已收起）';
+    }
+    if (state.partial) {
+      return '部分遮挡（已裁切）';
+    }
+    return '完整可见';
   }
 
   String _formatRect(Rect? rect) {
@@ -285,9 +390,10 @@ class _Banner extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
       ),
       child: const Text(
-        '窗口化渲染说明：CEF 创建的是真实子 HWND，而不是把画面渲染进纹理。'
-        '因此网页区域由系统合成、叠在 Flutter 内容之上，'
-        '无法被 Flutter 裁剪或设置圆角；被 Flutter 遮挡时需要主动隐藏。',
+        '窗口化渲染说明：CEF 创建的是真实子 HWND，而不是把画面渲染进纹理，'
+        '因此网页区域由系统合成、叠在 Flutter 内容之上。'
+        '当 Flutter 内容盖住它时，框架会自动算出仍然可见的矩形，'
+        '并通过 SetWindowRgn 把被盖住的部分从窗口上裁掉，网页本身照常运行。',
         style: TextStyle(fontSize: 12, height: 1.6),
       ),
     );
