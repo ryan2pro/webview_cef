@@ -290,7 +290,7 @@ class _CefWindowedViewState extends State<CefWindowedView>
             child: Text(
               available
                   ? 'CEF 窗口化渲染区域\n原生子窗口会精确覆盖此边框范围'
-                  : 'CEF 原生桥接不可用\n请以 Windows 桌面目标运行（需要 cef_bridge.dll）',
+                  : 'CEF 原生桥接不可用\n请以 Windows 桌面目标运行（需要 webview_cef_floating_cef.dll）',
               textAlign: TextAlign.center,
               style: const TextStyle(
                 fontSize: 13,

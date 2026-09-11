@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -38,6 +39,11 @@ namespace {
 
 /// How long CefShutdown() waits for outstanding browsers to close.
 constexpr DWORD kShutdownTimeoutMs = 5000;
+
+/// Name of the executable that hosts CEF's sub-processes. It is deployed next to
+/// the host executable by the plugin's build.
+constexpr wchar_t kSubprocessExecutable[] =
+    L"webview_cef_floating_subprocess.exe";
 
 /// Per-browser state, keyed by the slot id handed out to Dart.
 struct BrowserSlot {
@@ -74,12 +80,76 @@ bool EnsureLibCefLoaded() {
   return loaded;
 }
 
-/// Interprets \p utf8 as UTF-8 and returns the equivalent wide string.
-std::wstring ToWide(const char* utf8) {
-  if (utf8 == nullptr) {
-    return std::wstring();
+/// Full path of the running executable, or an empty string on failure.
+std::wstring GetExecutablePath() {
+  std::wstring buffer(MAX_PATH, L'\0');
+  for (;;) {
+    const DWORD length = ::GetModuleFileNameW(
+        nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0) {
+      return std::wstring();
+    }
+    if (length < buffer.size()) {
+      buffer.resize(length);
+      return buffer;
+    }
+    // The result was truncated, so retry with more room. The cap keeps a
+    // pathological path from growing the buffer without bound.
+    if (buffer.size() >= 32768) {
+      return std::wstring();
+    }
+    buffer.resize(buffer.size() * 2);
   }
-  return CefString(std::string(utf8)).ToWString();
+}
+
+/// Directory holding the running executable, without a trailing separator.
+std::wstring GetExecutableDirectory() {
+  const std::wstring path = GetExecutablePath();
+  const size_t separator = path.find_last_of(L"\\/");
+  return separator == std::wstring::npos ? std::wstring()
+                                        : path.substr(0, separator);
+}
+
+/// File name of the running executable without its extension.
+std::wstring GetExecutableStem() {
+  const std::wstring path = GetExecutablePath();
+  const size_t separator = path.find_last_of(L"\\/");
+  const size_t start = separator == std::wstring::npos ? 0 : separator + 1;
+  const size_t dot = path.find_last_of(L'.');
+  const size_t end = (dot == std::wstring::npos || dot < start) ? path.size()
+                                                               : dot;
+  return path.substr(start, end - start);
+}
+
+/// Returns the per-user cache directory handed to CEF.
+///
+/// CEF 120+ derives a process singleton lock from CefSettings.root_cache_path,
+/// so the path has to be stable across runs and unique per application. Deriving
+/// it from the host executable's name is what allows two different applications
+/// to embed this plugin without fighting over the lock.
+std::wstring GetCacheRootPath() {
+  wchar_t buffer[MAX_PATH] = {};
+  const DWORD length =
+      ::GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
+  if (length > 0 && length < MAX_PATH) {
+    std::wstring stem = GetExecutableStem();
+    if (stem.empty()) {
+      stem = L"webview_cef_floating";
+    }
+    return std::wstring(buffer, length) + L"\\" + stem + L"\\cef_cache";
+  }
+
+  // Fall back to the directory holding the executable.
+  const std::wstring directory = GetExecutableDirectory();
+  return directory.empty() ? std::wstring() : directory + L"\\cef_cache";
+}
+
+/// Absolute path of the executable that hosts CEF's sub-processes.
+std::wstring GetSubprocessPath() {
+  const std::wstring directory = GetExecutableDirectory();
+  return directory.empty()
+             ? std::wstring()
+             : directory + L"\\" + kSubprocessExecutable;
 }
 
 /// Creates \p path and every missing parent directory. Failure is not fatal
@@ -246,6 +316,14 @@ void CloseBrowserOnUiThread(int64_t slot) {
   }
 }
 
+/// CRT exit hook. The host runner cannot call into the bridge after its message
+/// loop has exited, so this is what guarantees CefShutdown() runs even when the
+/// window procedure observation never fires. cef_bridge_shutdown() is
+/// idempotent, so ordering against the other shutdown paths does not matter.
+void ShutdownAtProcessExit() {
+  cef_bridge_shutdown();
+}
+
 }  // namespace
 
 // --- Hooks used by CefBridgeClient (CEF UI thread) --------------------------
@@ -294,7 +372,7 @@ int cef_bridge_execute_process(void* instance) {
   return CefExecuteProcess(main_args, CefRefPtr<CefApp>(), nullptr);
 }
 
-int cef_bridge_initialize(void* instance, const char* cache_root_path) {
+int cef_bridge_initialize(void* instance) {
   if (g_initialized) {
     return 1;
   }
@@ -302,7 +380,7 @@ int cef_bridge_initialize(void* instance, const char* cache_root_path) {
     return 0;
   }
 
-  const std::wstring cache_path = ToWide(cache_root_path);
+  const std::wstring cache_path = GetCacheRootPath();
   if (!cache_path.empty()) {
     EnsureDirectoryExists(cache_path);
   }
@@ -326,11 +404,33 @@ int cef_bridge_initialize(void* instance, const char* cache_root_path) {
     CefString(&settings.cache_path) = cache_path;
   }
 
+  // Renderer, GPU and utility processes are hosted by a dedicated helper
+  // executable rather than by re-launching the host. That is what keeps the host
+  // runner's entry point free of CEF code, and it is why nothing has to happen
+  // in the host's wWinMain.
+  const std::wstring subprocess_path = GetSubprocessPath();
+  if (!subprocess_path.empty()) {
+    if (::GetFileAttributesW(subprocess_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+      // Pointing at a missing file is still better than leaving the setting
+      // empty: an empty value makes CEF relaunch the host executable as a
+      // renderer, which for a GUI application means spawning a second window.
+      OutputDebugStringW(
+          L"cef_bridge: sub-process helper not found next to the executable\n");
+    }
+    CefString(&settings.browser_subprocess_path) = subprocess_path;
+  }
+
   if (!CefInitialize(main_args, settings, CefRefPtr<CefApp>(), nullptr)) {
     return 0;
   }
 
   g_initialized = true;
+
+  // Nothing in the host runner may run after its message loop exits, so the CRT
+  // exit hook is the fallback that guarantees CefShutdown() still happens even
+  // if the window procedure observation never fires. Shutting down is
+  // idempotent, so running after (or before) the other paths is harmless.
+  std::atexit(&ShutdownAtProcessExit);
   return 1;
 }
 
@@ -518,7 +618,7 @@ const char* cef_bridge_version(void) {
   static const std::string kVersion = []() {
     char buffer[160];
     std::snprintf(buffer, sizeof(buffer),
-                  "webview_cef bridge | CEF %d.%d.%d | Chromium %d.%d.%d.%d",
+                  "webview_cef_floating | CEF %d.%d.%d | Chromium %d.%d.%d.%d",
                   CEF_VERSION_MAJOR, CEF_VERSION_MINOR, CEF_VERSION_PATCH,
                   CHROME_VERSION_MAJOR, CHROME_VERSION_MINOR,
                   CHROME_VERSION_BUILD, CHROME_VERSION_PATCH);
@@ -528,3 +628,20 @@ const char* cef_bridge_version(void) {
 }
 
 }  // extern "C"
+
+// --- Last resort ------------------------------------------------------------
+
+/// Reports a process that went away without tearing CEF down.
+///
+/// CefShutdown() must deliberately not be called from here: DLL_PROCESS_DETACH
+/// runs while the loader lock is held, and CEF's teardown loads and unloads
+/// modules, which deadlocks under that lock. The plugin's window procedure
+/// observation and its destructor, plus the CRT exit hook registered in
+/// cef_bridge_initialize(), cover every orderly shutdown.
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved) {
+  if (reason == DLL_PROCESS_DETACH && reserved != nullptr && g_initialized) {
+    OutputDebugStringW(
+        L"cef_bridge: process exited before CEF was shut down\n");
+  }
+  return TRUE;
+}

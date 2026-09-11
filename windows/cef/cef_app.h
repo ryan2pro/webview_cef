@@ -1,5 +1,5 @@
-#ifndef RUNNER_CEF_APP_H_
-#define RUNNER_CEF_APP_H_
+#ifndef WEBVIEW_CEF_FLOATING_CEF_APP_H_
+#define WEBVIEW_CEF_FLOATING_CEF_APP_H_
 
 // CEF client implementation for a single windowed browser.
 //
@@ -7,8 +7,8 @@
 // callbacks can be routed back to the owning bridge slot without any global
 // lookup by browser id.
 //
-// Everything in this header is internal to cef_bridge.dll; the runner exe and
-// Dart only ever see the plain C ABI from cef_bridge.h.
+// Everything in this header is internal to the CEF implementation library; the
+// plugin shell and Dart only ever see the plain C ABI from cef_bridge.h.
 
 #include <stdint.h>
 
@@ -52,4 +52,4 @@ class CefBridgeClient : public CefClient, public CefLifeSpanHandler {
   IMPLEMENT_REFCOUNTING(CefBridgeClient);
 };
 
-#endif  // RUNNER_CEF_APP_H_
+#endif  // WEBVIEW_CEF_FLOATING_CEF_APP_H_

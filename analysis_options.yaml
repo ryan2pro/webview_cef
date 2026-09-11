@@ -9,3 +9,5 @@ analyzer:
     - windows/**
     - macos/**
     - linux/**
+    # The example is a standalone package with its own analysis options.
+    - example/**

@@ -1,5 +1,5 @@
-name: webview_cef
-description: "A new Flutter project."
+name: webview_cef_floating
+description: "Flutter Windows plugin that embeds a CEF (Chromium Embedded Framework) browser as a real native child window floating above the Flutter view."
 publish_to: 'none'
 version: 0.1.0+1
 
@@ -10,10 +10,10 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Dart FFI: loads cef_bridge.dll and drives the embedded browser.
+  # Dart FFI: drives the embedded browser through the plugin's native library.
   ffi: ^2.1.0
 
-  # Resolves the cef_bridge.dll that sits next to the executable.
+  # Resolves the native library that sits next to the executable.
   path: ^1.9.0
 
 dev_dependencies:
@@ -23,3 +23,12 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+  # This section identifies this package as a plugin. The Windows entry point is
+  # registered by the host application's generated plugin registrant, which is
+  # what lets the plugin bootstrap CEF on the process main thread without the
+  # host runner containing any CEF code of its own.
+  plugin:
+    platforms:
+      windows:
+        pluginClass: WebviewCefFloatingPluginCApi

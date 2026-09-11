@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
-
-import 'src/native/cef_native_controller.dart';
-import 'src/widgets/cef_windowed_view.dart';
+// The only import a host application needs. Note that nothing in this project's
+// windows/runner directory mentions CEF: the plugin bootstraps it.
+import 'package:webview_cef_floating/webview_cef_floating.dart';
 
 const String kDefaultUrl = 'https://example.com';
 
@@ -15,7 +15,7 @@ class CefDemoApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'webview_cef',
+      title: 'webview_cef_floating example',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,

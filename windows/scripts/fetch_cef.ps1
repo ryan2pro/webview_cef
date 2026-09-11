@@ -306,5 +306,5 @@ Write-Step 'Done'
 Write-Host "CEF $Version is ready." -ForegroundColor Green
 Write-Host "CEF_ROOT = $CefRoot"
 Write-Host ''
-Write-Host 'Next: build the Windows runner with "flutter run -d windows"; CMake picks up third_party/cef automatically.'
+Write-Host 'Next: build the example application with "cd example; flutter run -d windows"; the plugin CMake picks up third_party/cef automatically.'
 exit 0
