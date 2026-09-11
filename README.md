@@ -291,6 +291,25 @@ Dart 侧把槽位矩形收敛成「仍然可见的矩形集合」，两条互补
 - 跨 FFI 沿用 1px 阈值去重：可见矩形集合没有实质变化就完全不下发，动画期间每帧至多一次；
 - 路由推入、抽屉滑出等动画期间裁切逐帧跟随真实布局，不做额外插值，也不需要显式节流。
 
+### 滚动为什么不闪烁
+
+滚动是这套机制里最密集的场景：窗口每一帧都要移动。原生侧因此只在**真正发生变化**时才动作：
+
+- 可见区域按**窗口自身坐标**比较：遮挡物跟着页面一起滚时形状没有变，Dart 侧不会发起
+  FFI 调用，原生侧也不会碰 `SetWindowRgn`；
+- 每帧只做一次 `SetWindowPos`：几何与裁切被合并为一次应用（同槽位的重复请求会被折叠），
+  且只有可见性真正翻转时才带上 `SWP_SHOWWINDOW` / `SWP_HIDEWINDOW`；
+- `NotifyMoveOrResizeStarted()` 只在尺寸变化时调用。滚动只改变位置，逐帧调用它会让 CEF
+  反复暂停与恢复合成，本身就是闪烁来源；
+- 同一帧内先设形状再移动窗口，窗口不会以「上一帧的形状 + 这一帧的位置」被呈现出来，
+  裁切边缘因此不会闪一下；
+- 槽位整块可见时下发的是「等于槽位的区域」，原生识别为无需裁切并清除窗口区域，
+  所以普通滚动完全不产生区域开销。
+
+当滚动的槽位被滚动视口切掉一部分时，可见形状确实每帧都在变，区域就必须跟着更新——这是
+让被切掉的部分消失所必需的动作。若个别机器上仍能观察到闪烁，可改用
+`CefClipMode.geometry`（把窗口收进可见包围盒，代价是网页会重排）或 `CefClipMode.hide`。
+
 ### 例外与忽略的情况
 
 | 场景 | 行为 |
@@ -384,6 +403,7 @@ flutter run -d windows
 | 弹窗/路由被网页遮挡 | 正常情况下插件会自动裁切／收起该区域。若仍被遮挡，说明覆盖层不参与命中测试（例如被 `IgnorePointer` 包住），改用 `visible` 手动兜底 |
 | 部分遮挡时网页没有被裁掉 | 原生库早于裁切功能，`CefNativeController.supportsClipping` 为 false；重新构建原生库，或临时用 `CefClipMode.hide` |
 | `SetWindowRgn` 在本机不生效（裁切无效或残影） | 个别硬件合成路径的限制，改用 `CefClipMode.geometry` 或 `CefClipMode.hide` |
+| 滚动时网页闪烁 | 位置变化不再触碰窗口区域（遮挡物随页面滚动时形状不变），只有被滚动视口切掉一部分时才需要逐帧更新区域。仍可见闪烁时改用 `CefClipMode.geometry` 或 `CefClipMode.hide`，并把 `occlusionProbeInterval` 调大以减少探针频率 |
 | 退出后调试输出 `process exited before CEF was shut down` | 宿主以非正常方式结束了进程（例如 `TerminateProcess`），CEF 未被拆卸 |
 | `pub did not create example/.dart_tools/package_config.json` | 在插件根执行 `pub get` 时 example 也必须能解析；先 `cd example; flutter pub get` |
 | 构建报 MSVC 工具集不兼容 | 升级 VS 2022 / Windows SDK，或用 `-Version` 切换到更旧的 CEF stable 分支 |

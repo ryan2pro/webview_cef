@@ -369,6 +369,14 @@ class _CefWindowedViewState extends State<CefWindowedView>
 
       if (mode == CefClipMode.region) {
         _pushClip(controller, slot, visibleRects, logicalBounds);
+      } else if (_lastPushedClip != null) {
+        // Switching away from region mode must not leave the browser carrying
+        // the region it had before.
+        controller.setClip(
+          slot: slot,
+          rects: <Rect>[toPhysicalBounds(logicalBounds, _devicePixelRatio)],
+        );
+        _lastPushedClip = null;
       }
     }
 
@@ -450,15 +458,23 @@ class _CefWindowedViewState extends State<CefWindowedView>
     final List<Rect> target = coversRect(visibleRects, logicalBounds)
         ? <Rect>[logicalBounds]
         : visibleRects;
+    final Rect window = toPhysicalBounds(logicalBounds, _devicePixelRatio);
     final List<Rect> physical = quantizeRects(<Rect>[
       for (final Rect rect in target) toPhysicalBounds(rect, _devicePixelRatio),
     ]);
 
-    if (!_clipDiffers(physical, _lastPushedClip)) {
+    // Compared relative to the window, because that is the space the native side
+    // keeps its region in. Scrolling a slot whose clipped shape does not change
+    // - an overlay travelling with the page, for instance - therefore costs
+    // nothing here at all, and never reaches the window.
+    final List<Rect> relative = <Rect>[
+      for (final Rect rect in physical) rect.shift(-window.topLeft),
+    ];
+    if (!_clipDiffers(relative, _lastPushedClip)) {
       return;
     }
     controller.setClip(slot: slot, rects: physical);
-    _lastPushedClip = physical;
+    _lastPushedClip = relative;
   }
 
   bool _clipDiffers(List<Rect> next, List<Rect>? previous) {

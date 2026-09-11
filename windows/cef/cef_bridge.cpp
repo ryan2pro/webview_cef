@@ -47,6 +47,35 @@ constexpr DWORD kShutdownTimeoutMs = 5000;
 constexpr wchar_t kSubprocessExecutable[] =
     L"webview_cef_floating_subprocess.exe";
 
+/// What the last UI-thread pass actually pushed to the browser window.
+///
+/// Scrolling changes the geometry on every frame, but changes nothing else, so
+/// remembering the applied state is what keeps a moving window down to a single
+/// SetWindowPos: the visibility flags are only passed when they flip, and the
+/// window region is only rebuilt when its shape relative to the window changes.
+///
+/// The region is stored in the window's own coordinates on purpose. Moving the
+/// window does not change that shape, so a frame that only scrolls the window
+/// does not have to touch SetWindowRgn at all - which is the difference between
+/// a smooth scroll and one that flickers.
+struct AppliedState {
+  /// False until the window has been configured at least once.
+  bool valid = false;
+
+  /// Geometry handed to SetWindowPos last time.
+  CefRect bounds = CefRect(0, 0, 0, 0);
+
+  /// Whether the window was left shown.
+  bool shown = false;
+
+  /// Client rectangle the region was measured against, so that a resize
+  /// re-evaluates whether the region is still needed.
+  RECT client = {};
+
+  /// Region the window carries, in its own coordinates. Empty means none.
+  std::vector<RECT> region;
+};
+
 /// Per-browser state, keyed by the slot id handed out to Dart.
 struct BrowserSlot {
   /// Set on the CEF UI thread by OnAfterCreated, cleared by OnBeforeClose.
@@ -66,10 +95,15 @@ struct BrowserSlot {
   std::vector<CefRect> clip_rects;
   bool has_clip = false;
 
-  /// Whether the browser window currently carries a window region. Written on
-  /// the CEF UI thread, read there too, so that the common "nothing is clipped"
-  /// geometry update does not cost an extra SetWindowRgn.
-  bool region_applied = false;
+  /// Written on the CEF UI thread, read there too.
+  AppliedState applied;
+
+  /// True while an ApplyStateOnUiThread task is queued for this slot.
+  ///
+  /// A single frame asks for geometry and for the window region separately;
+  /// without this the browser window would be moved and reshaped once per call
+  /// instead of once per frame, which is exactly what makes it flicker.
+  bool apply_pending = false;
 
   /// Initial URL, consumed when the browser is created.
   std::string url;
@@ -219,6 +253,24 @@ RECT ToWindowRect(const CefRect& rect, const CefRect& slot, int dx, int dy) {
   return result;
 }
 
+/// Whether two rectangle lists describe the same window shape.
+///
+/// Both sides come from the same closed loop - the slot's clip rectangles are
+/// translated with the same origin offset every time - so comparing them
+/// element by element is enough to decide that a SetWindowRgn would be a no-op.
+bool SameRects(const std::vector<RECT>& a, const std::vector<RECT>& b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i].left != b[i].left || a[i].top != b[i].top ||
+        a[i].right != b[i].right || a[i].bottom != b[i].bottom) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Offset between the browser window's client origin and its window origin.
 ///
 /// CEF's windowed child is borderless, so this is normally (0, 0), which makes
@@ -238,59 +290,76 @@ void GetClientOriginOffset(HWND hwnd, int* dx, int* dy) {
   *dy = client_origin.y - window_rect.top;
 }
 
-/// Applies \p rects as the window region of \p hwnd.
+/// Applies \p rects as the window region of \p hwnd, unless the window already
+/// carries exactly that shape.
 ///
-/// A region that covers the whole client area, or no region at all, is
-/// expressed by clearing the region: while nothing is clipped the window stays
-/// free of region bookkeeping, so the common case costs nothing.
+/// Rectangles arrive in host client coordinates and are translated into the
+/// browser window's own space first. That is what SetWindowRgn expects, and it
+/// also makes the shape independent of where the window sits, so moving the
+/// window never has to rebuild it.
 ///
-/// \return True when the window now carries a region.
+/// A set that covers the whole client area, or an empty set, clears the region:
+/// while nothing is clipped the window stays free of region bookkeeping.
+///
+/// \param applied Updated with the shape the window carries afterwards.
+/// \return True when SetWindowRgn was called.
 bool ApplyWindowRegion(HWND hwnd,
                        const CefRect& slot,
-                       const std::vector<CefRect>& rects) {
-  if (rects.empty()) {
-    ::SetWindowRgn(hwnd, nullptr, TRUE);
-    return false;
-  }
-
+                       const std::vector<CefRect>& rects,
+                       AppliedState* applied) {
   RECT client = {};
   ::GetClientRect(hwnd, &client);
 
-  int dx = 0;
-  int dy = 0;
-  GetClientOriginOffset(hwnd, &dx, &dy);
+  std::vector<RECT> target;
+  if (!rects.empty()) {
+    int dx = 0;
+    int dy = 0;
+    GetClientOriginOffset(hwnd, &dx, &dy);
 
-  std::vector<RECT> window_rects;
-  window_rects.reserve(rects.size());
-  for (const CefRect& rect : rects) {
-    window_rects.push_back(ToWindowRect(rect, slot, dx, dy));
+    target.reserve(rects.size());
+    for (const CefRect& rect : rects) {
+      target.push_back(ToWindowRect(rect, slot, dx, dy));
+    }
+
+    if (target.size() == 1 && target[0].left <= client.left &&
+        target[0].top <= client.top && target[0].right >= client.right &&
+        target[0].bottom >= client.bottom) {
+      // The whole window is visible, so a region would be pure overhead.
+      target.clear();
+    }
   }
 
-  if (window_rects.size() == 1 && window_rects[0].left <= client.left &&
-      window_rects[0].top <= client.top &&
-      window_rects[0].right >= client.right &&
-      window_rects[0].bottom >= client.bottom) {
-    // The whole window is visible, so a region would be pure overhead.
-    ::SetWindowRgn(hwnd, nullptr, TRUE);
+  const bool same_client = applied->valid && applied->client.left == client.left &&
+                           applied->client.top == client.top &&
+                           applied->client.right == client.right &&
+                           applied->client.bottom == client.bottom;
+  if (same_client && SameRects(applied->region, target)) {
     return false;
+  }
+
+  applied->client = client;
+  applied->region = target;
+
+  if (target.empty()) {
+    ::SetWindowRgn(hwnd, nullptr, TRUE);
+    return true;
   }
 
   // One ExtCreateRegion call instead of a CombineRgn chain: the region is built
   // off-screen and only handed to the window once it is complete, so the window
   // never presents an intermediate shape.
-  const size_t bytes =
-      sizeof(RGNDATAHEADER) + window_rects.size() * sizeof(RECT);
+  const size_t bytes = sizeof(RGNDATAHEADER) + target.size() * sizeof(RECT);
   std::vector<unsigned char> buffer(bytes);
   RGNDATA* data = reinterpret_cast<RGNDATA*>(buffer.data());
   data->rdh.dwSize = sizeof(RGNDATAHEADER);
   data->rdh.iType = RDH_RECTANGLES;
-  data->rdh.nCount = static_cast<DWORD>(window_rects.size());
-  data->rdh.nRgnSize = static_cast<DWORD>(window_rects.size() * sizeof(RECT));
+  data->rdh.nCount = static_cast<DWORD>(target.size());
+  data->rdh.nRgnSize = static_cast<DWORD>(target.size() * sizeof(RECT));
 
   RECT* output = reinterpret_cast<RECT*>(data->Buffer);
-  RECT bound = window_rects[0];
-  for (size_t i = 0; i < window_rects.size(); ++i) {
-    output[i] = window_rects[i];
+  RECT bound = target[0];
+  for (size_t i = 0; i < target.size(); ++i) {
+    output[i] = target[i];
     bound.left = std::min(bound.left, output[i].left);
     bound.top = std::min(bound.top, output[i].top);
     bound.right = std::max(bound.right, output[i].right);
@@ -301,20 +370,25 @@ bool ApplyWindowRegion(HWND hwnd,
   HRGN region = ::ExtCreateRegion(nullptr, static_cast<DWORD>(bytes), data);
   if (region == nullptr) {
     OutputDebugStringW(L"cef_bridge: could not build a window region\n");
+    applied->region.clear();
     return false;
   }
 
-  // On success the system owns the region; deleting it would be a bug.
+  // On success the system owns the region; deleting it here would be a bug.
   if (::SetWindowRgn(hwnd, region, TRUE) == 0) {
     ::DeleteObject(region);
     OutputDebugStringW(L"cef_bridge: SetWindowRgn failed\n");
+    applied->region.clear();
     return false;
   }
   return true;
 }
 
 /// Moves/resizes, shows/hides and clips the browser window.
-/// Runs on the CEF UI thread.
+///
+/// Runs on the CEF UI thread and is deliberately a no-op when nothing actually
+/// changed: every entry point posts it, and a frame routinely asks for geometry
+/// and for the window region separately.
 void ApplyStateOnUiThread(int64_t slot) {
   CEF_REQUIRE_UI_THREAD();
 
@@ -323,20 +397,21 @@ void ApplyStateOnUiThread(int64_t slot) {
   bool has_bounds = false;
   bool visible = true;
   bool has_clip = false;
-  bool region_applied = false;
+  AppliedState applied;
   std::vector<CefRect> clip_rects;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    const BrowserSlot* state = FindSlotLocked(slot);
+    BrowserSlot* state = FindSlotLocked(slot);
     if (state == nullptr) {
       return;
     }
+    state->apply_pending = false;
     browser = state->browser;
     bounds = state->bounds;
     has_bounds = state->has_bounds;
     visible = state->visible;
     has_clip = state->has_clip;
-    region_applied = state->region_applied;
+    applied = state->applied;
     clip_rects = state->clip_rects;
   }
 
@@ -360,31 +435,97 @@ void ApplyStateOnUiThread(int64_t slot) {
     return;
   }
 
-  // Tells CEF the hosted window is about to move so it can suspend and resume
-  // painting cleanly instead of tearing. This is the windowed-rendering
+  const bool moves = !applied.valid || applied.bounds.x != bounds.x ||
+                     applied.bounds.y != bounds.y;
+  const bool resizes = !applied.valid || applied.bounds.width != bounds.width ||
+                       applied.bounds.height != bounds.height;
+  const bool show_flips = !applied.valid || applied.shown != show;
+  const bool wants_region = has_clip && !region_empty;
+
+  const auto move_window = [&]() {
+    UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
+    if (show_flips) {
+      // Only ask for a visibility change when there is one: passing
+      // SWP_SHOWWINDOW on every frame makes the window go through the show path
+      // while it is being scrolled.
+      flags |= show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW;
+    }
+    ::SetWindowPos(hwnd, nullptr, bounds.x, bounds.y, bounds.width, bounds.height,
+                   flags);
+  };
+
+  // Tells CEF the hosted window is about to change size so it can suspend and
+  // resume painting cleanly instead of tearing. This is the windowed-rendering
   // counterpart of WasResized(), which only applies to off-screen browsers.
-  host->NotifyMoveOrResizeStarted();
+  //
+  // It is deliberately not called for plain movement: scrolling moves the window
+  // on every frame, and suspending painting that often is a flicker of its own.
+  const auto resize_window = [&]() {
+    if (!resizes) {
+      return;
+    }
+    host->NotifyMoveOrResizeStarted();
+    move_window();
+  };
 
-  UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
-  flags |= show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW;
-  ::SetWindowPos(hwnd, nullptr, bounds.x, bounds.y, bounds.width, bounds.height,
-                 flags);
+  const std::vector<CefRect> region_rects =
+      wants_region ? clip_rects : std::vector<CefRect>();
 
-  // Only touch the window region when the state actually changes: scrolling and
-  // resizing post this function on every frame, and re-clearing an absent region
-  // would repaint the window for nothing.
-  if (has_clip && !region_empty) {
-    region_applied = ApplyWindowRegion(hwnd, bounds, clip_rects);
-  } else if (region_applied) {
-    ::SetWindowRgn(hwnd, nullptr, TRUE);
-    region_applied = false;
+  if (resizes) {
+    // A resize changes the client area the region is measured against, so the
+    // window has to reach its new size before the region is rebuilt.
+    resize_window();
+    ApplyWindowRegion(hwnd, bounds, region_rects, &applied);
+  } else {
+    // Shaping first keeps the window from being presented at its new position
+    // with the previous frame's region, which shows up as a flash along the
+    // clipped edge.
+    if (wants_region || !applied.region.empty()) {
+      ApplyWindowRegion(hwnd, bounds, region_rects, &applied);
+    }
+    if (moves || show_flips) {
+      move_window();
+    }
   }
+
+  applied.valid = true;
+  applied.bounds = bounds;
+  applied.shown = show;
 
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     BrowserSlot* state = FindSlotLocked(slot);
     if (state != nullptr) {
-      state->region_applied = region_applied;
+      state->applied = std::move(applied);
+    }
+  }
+}
+
+/// Queues one state application for \p slot, collapsing duplicates.
+///
+/// Doing nothing when a task is already queued is safe because that task reads
+/// the newest state: the setters only publish values, they never bake them into
+/// the queued work.
+void PostApply(int64_t slot) {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    BrowserSlot* state = FindSlotLocked(slot);
+    if (state == nullptr || state->browser.get() == nullptr) {
+      // Unknown slot, or creation is still in flight and
+      // CefBridgeApplyPendingState() will replay this state instead.
+      return;
+    }
+    if (state->apply_pending) {
+      return;
+    }
+    state->apply_pending = true;
+  }
+
+  if (!CefPostTask(TID_UI, base::BindOnce(&ApplyStateOnUiThread, slot))) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    BrowserSlot* state = FindSlotLocked(slot);
+    if (state != nullptr) {
+      state->apply_pending = false;
     }
   }
 }
@@ -643,7 +784,6 @@ void cef_bridge_set_bounds(int64_t slot,
     return;
   }
 
-  bool has_browser = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     BrowserSlot* state = FindSlotLocked(slot);
@@ -652,19 +792,11 @@ void cef_bridge_set_bounds(int64_t slot,
     }
     state->bounds = CefRect(x, y, width, height);
     state->has_bounds = true;
-    has_browser = state->browser.get() != nullptr;
   }
-
-  if (!has_browser) {
-    // Creation is still in flight; CefBridgeApplyPendingState() replays this
-    // geometry from OnAfterCreated.
-    return;
-  }
-  CefPostTask(TID_UI, base::BindOnce(&ApplyStateOnUiThread, slot));
+  PostApply(slot);
 }
 
 void cef_bridge_set_visible(int64_t slot, int32_t visible) {
-  bool has_browser = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     BrowserSlot* state = FindSlotLocked(slot);
@@ -672,13 +804,8 @@ void cef_bridge_set_visible(int64_t slot, int32_t visible) {
       return;
     }
     state->visible = visible != 0;
-    has_browser = state->browser.get() != nullptr;
   }
-
-  if (!has_browser) {
-    return;
-  }
-  CefPostTask(TID_UI, base::BindOnce(&ApplyStateOnUiThread, slot));
+  PostApply(slot);
 }
 
 void cef_bridge_set_clip(int64_t slot,
@@ -699,7 +826,6 @@ void cef_bridge_set_clip(int64_t slot,
     clip_rects.push_back(CefRect(rect.x, rect.y, rect.width, rect.height));
   }
 
-  bool has_browser = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     BrowserSlot* state = FindSlotLocked(slot);
@@ -708,15 +834,8 @@ void cef_bridge_set_clip(int64_t slot,
     }
     state->clip_rects = std::move(clip_rects);
     state->has_clip = true;
-    has_browser = state->browser.get() != nullptr;
   }
-
-  if (!has_browser) {
-    // Creation is still in flight; CefBridgeApplyPendingState() replays this
-    // geometry for the caller.
-    return;
-  }
-  CefPostTask(TID_UI, base::BindOnce(&ApplyStateOnUiThread, slot));
+  PostApply(slot);
 }
 
 void cef_bridge_load_url(int64_t slot, const char* url) {

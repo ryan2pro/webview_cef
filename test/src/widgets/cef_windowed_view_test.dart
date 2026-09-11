@@ -238,6 +238,67 @@ void main() {
     expect(surface.visible, contains(false));
   });
 
+  testWidgets('does not re-clip a shape that travels with the slot', (
+    WidgetTester tester,
+  ) async {
+    final _FakeSurface surface = _FakeSurface();
+    final ScrollController scroll = ScrollController();
+    addTearDown(scroll.dispose);
+
+    tester.view.physicalSize = const Size(400, 600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: ListView(
+            controller: scroll,
+            children: <Widget>[
+              const SizedBox(height: 200),
+              SizedBox(
+                height: 200,
+                child: Stack(
+                  children: <Widget>[
+                    Positioned.fill(
+                      child: CefWindowedView(
+                        url: 'https://example.com',
+                        controller: surface,
+                      ),
+                    ),
+                    const Positioned(
+                      left: 0,
+                      top: 0,
+                      width: 100,
+                      height: 200,
+                      child: ColoredBox(color: Color(0xFFFF0000)),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 200),
+              const SizedBox(height: 200),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(surface.clips.length, 1);
+    final int moved = surface.bounds.length;
+
+    scroll.jumpTo(30);
+    await tester.pump();
+
+    // The window follows the scroll...
+    expect(surface.bounds.length, greaterThan(moved));
+    // ...but the panel travelled with it, so the clipped shape relative to the
+    // window did not change and the region must be left alone. Re-sending it
+    // every frame is what makes a scrolling browser flicker.
+    expect(surface.clips.length, 1);
+    expect(surface.visible, isNot(contains(false)));
+  });
+
   testWidgets('gives up the slot to a route pushed over it', (
     WidgetTester tester,
   ) async {
