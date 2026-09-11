@@ -1,7 +1,7 @@
 import 'dart:ui' show Rect;
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:webview_cef/src/widgets/cef_geometry.dart';
+import 'package:webview_cef_floating/src/widgets/cef_geometry.dart';
 
 void main() {
   group('toPhysicalBounds', () {

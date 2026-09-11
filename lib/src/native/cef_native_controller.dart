@@ -4,8 +4,8 @@ import 'cef_ffi_bindings.dart';
 
 /// Process-wide access point to the native CEF bridge.
 ///
-/// CEF itself is initialized by the runner executable during process startup, so
-/// this controller only binds the runtime entry points and forwards geometry.
+/// CEF itself is initialized by the plugin while Flutter registers it, so this
+/// controller only binds the runtime entry points and forwards geometry.
 /// Resolution happens once and is then cached; a missing bridge is a normal,
 /// non-fatal condition so the widget tree can fall back to a placeholder.
 class CefNativeController {
@@ -17,7 +17,7 @@ class CefNativeController {
   final CefNativeBindings _bindings;
 
   /// Returns the controller, or null when the native bridge is unavailable
-  /// (non-Windows host, missing or stale `cef_bridge.dll`).
+  /// (non-Windows host, or a missing/stale native library).
   static CefNativeController? instance() {
     if (!_resolved) {
       _resolved = true;

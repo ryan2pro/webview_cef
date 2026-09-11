@@ -4,8 +4,8 @@ import 'dart:io';
 import 'package:ffi/ffi.dart';
 import 'package:path/path.dart' as p;
 
-// Native signatures of the plain C ABI exposed by cef_bridge.dll.
-// Keep in sync with windows/runner/cef_bridge.h.
+// Native signatures of the plain C ABI exposed by the plugin's native library.
+// Keep in sync with windows/cef/cef_bridge.h.
 
 typedef _VersionNative = Pointer<Utf8> Function();
 typedef _VersionDart = Pointer<Utf8> Function();
@@ -49,12 +49,13 @@ typedef _LoadUrlDart = void Function(int slot, Pointer<Utf8> url);
 typedef _DestroyBrowserNative = Void Function(Int64 slot);
 typedef _DestroyBrowserDart = void Function(int slot);
 
-/// Thin, null-safe wrapper around the `cef_bridge.dll` exports.
+/// Thin, null-safe wrapper around the plugin's native library exports.
 ///
-/// CEF itself is initialized by the runner executable during process startup
-/// (`wWinMain`), so Dart only ever drives browsers that already exist at the
-/// native level. Loading this library therefore never changes global state; it
-/// just binds the functions used to create, move, show and destroy browsers.
+/// CEF is brought up by the plugin itself while Flutter registers it, which the
+/// host runner does on the process main thread and before Dart can issue any
+/// command. Dart therefore only ever drives browsers that already exist at the
+/// native level, and loading this library never changes global state; it just
+/// binds the functions used to create, move, show and destroy browsers.
 class CefNativeBindings {
   CefNativeBindings._(
     this._version,
@@ -65,8 +66,8 @@ class CefNativeBindings {
     this._destroyBrowser,
   );
 
-  /// File name of the bridge library, always deployed next to the executable.
-  static const String libraryName = 'cef_bridge.dll';
+  /// File name of the native library, always deployed next to the executable.
+  static const String libraryName = 'webview_cef_floating_cef.dll';
 
   final _VersionDart _version;
   final _CreateBrowserDart _createBrowser;
